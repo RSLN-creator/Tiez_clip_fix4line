@@ -1,14 +1,16 @@
-use windows::Win32::Foundation::{HWND, RECT};
+use std::sync::atomic::{AtomicIsize, Ordering};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN,
-    VK_RWIN,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, MessageBoxW, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST,
-    MB_ICONERROR, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
-    SW_SHOWNA,
+    BringWindowToTop, CallNextHookEx, GA_ROOT, GetAncestor, GetForegroundWindow, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, LLMHF_INJECTED, MessageBoxW,
+    MSLLHOOKSTRUCT, PostMessageW, SetForegroundWindow, SetWindowPos, SetWindowsHookExW,
+    ShowWindow, WindowFromPoint, HWND_TOPMOST, MB_ICONERROR, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOWNA, WH_MOUSE_LL, WM_MOUSEWHEEL,
 };
 
 /// 安全封装的窗口辅助工具
@@ -161,4 +163,58 @@ impl WindowExt {
             },
         }
     }
+}
+
+// ============ 无焦点窗口滚轮转发 ============
+// 主窗口以 WS_EX_NOACTIVATE + SW_SHOWNA 呼出时不持有键盘焦点，Windows 会把
+// WM_MOUSEWHEEL 投递给焦点窗口而非光标下窗口，导致鼠标滚轮失效或穿透到底下应用。
+// WH_MOUSE_LL 钩子在系统路由前拦截：光标命中主窗口树时，把滚轮消息直接投递给
+// 命中的 WebView2 子窗口并吞掉。触摸板走 WM_POINTERWHEEL（按光标位置投递），不受影响。
+
+static WHEEL_MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+static WHEEL_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// 安装低级鼠标滚轮钩子（进程生命周期内有效，进程退出时由系统回收）
+pub fn install_wheel_forward_hook(main_hwnd: isize) {
+    if WHEEL_MOUSE_HOOK.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    WHEEL_MAIN_HWND.store(main_hwnd, Ordering::Relaxed);
+    unsafe {
+        if let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(wheel_ll_proc), None, 0) {
+            WHEEL_MOUSE_HOOK.store(hook.0 as usize as isize, Ordering::Relaxed);
+        }
+    }
+}
+
+unsafe extern "system" fn wheel_ll_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if n_code >= 0 && w_param.0 as u32 == WM_MOUSEWHEEL {
+        let info = &*(l_param.0 as *const MSLLHOOKSTRUCT);
+        // 过滤注入事件，避免吞掉 AutoHotkey 等工具注入的滚轮（PostMessage 自身不经过本钩子）
+        if info.flags & LLMHF_INJECTED == 0 {
+            let hit = WindowFromPoint(info.pt);
+            if GetAncestor(hit, GA_ROOT).0 as isize == WHEEL_MAIN_HWND.load(Ordering::Relaxed) {
+                // wParam：高 16 位 = 带符号 wheel delta，低 16 位 = MK_* 修饰键
+                let delta = ((info.mouseData >> 16) as u16 as usize) << 16;
+                let mut mods = 0usize;
+                if GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0 {
+                    mods |= 0x8; // MK_CONTROL
+                }
+                if GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0 {
+                    mods |= 0x4; // MK_SHIFT
+                }
+                // lParam：屏幕坐标，x 低位 / y 高位（i16 保位，兼容负坐标显示器）
+                let l_fwd = ((info.pt.y as i16 as u16 as usize) << 16)
+                    | info.pt.x as i16 as u16 as usize;
+                let _ = PostMessageW(
+                    Some(hit),
+                    WM_MOUSEWHEEL,
+                    WPARAM(delta | mods),
+                    LPARAM(l_fwd as isize),
+                );
+                return LRESULT(1); // 吞掉，不再投递给前台焦点窗口
+            }
+        }
+    }
+    CallNextHookEx(None, n_code, w_param, l_param)
 }

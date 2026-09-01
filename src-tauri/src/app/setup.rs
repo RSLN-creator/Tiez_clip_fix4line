@@ -451,6 +451,8 @@ fn setup_main_window(app: &App, s: &StartupSettings) {
                     );
                 }
             }
+            // 无焦点呼出时鼠标滚轮无法路由到本窗口，安装钩子转发滚轮消息
+            crate::infrastructure::windows_ext::install_wheel_forward_hook(hwnd.0 as isize);
         }
 
         if repair_window_position_if_needed(&window, s.edge_docking) {
