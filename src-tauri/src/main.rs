@@ -13,9 +13,88 @@ pub mod services;
 
 use crate::app::setup;
 use crate::global_state::*;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set as soon as this app's own Tauri `setup` hook starts running.
+///
+/// Tauri creates the windows declared in `tauri.conf.json` *before* that hook, and the
+/// main window is a WebView2 window. If WebView2 environment creation stalls there, the
+/// process stays alive forever having done nothing observable - no window, no tray icon,
+/// no `tiez.log` line - which is exactly what "I clicked it and nothing happens" looks
+/// like. The watchdog below turns that silence into a message and a report file.
+pub static APP_SETUP_REACHED: AtomicBool = AtomicBool::new(false);
+
+/// Names of the diagnostic files written next to the executable.
+const STARTUP_TIMEOUT_LOG: &str = "tiez-startup-timeout.log";
+
+fn report_dir_log(name: &str) -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+}
+
+/// Writes a panic report next to the executable (and to %TEMP% as a fallback).
+///
+/// Why this exists: the release build is a `windows_subsystem = "windows"` binary with
+/// `panic = "abort"`, and Tauri turns a failed `App::setup()` - which includes creating
+/// the configured windows, *before* any of this app's own startup code runs - into
+/// `panic!("Failed to setup app: {e}")`. Without this hook that failure terminates the
+/// process with no window, no tray icon and not a single line in `tiez.log`, which is
+/// indistinguishable from "the exe does nothing when I click it".
+fn install_crash_reporter() {
+    let exe_dir_log = report_dir_log("tiez-crash.log");
+
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("TieZ startup panic:\n{info}\n");
+        if let Some(path) = &exe_dir_log {
+            let _ = std::fs::write(path, &msg);
+        }
+        let _ = std::fs::write(std::env::temp_dir().join("tiez-crash.log"), &msg);
+    }));
+}
+
+/// If the app's own setup hook has not started after `SECS`, the webview never came up.
+/// Write a report and tell the user instead of leaving a hung, invisible process behind.
+fn install_startup_watchdog() {
+    const SECS: u64 = 20;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(SECS));
+        if APP_SETUP_REACHED.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let msg = format!(
+            "TieZ did not finish starting up within {} seconds.\n\
+             \n\
+             The Windows WebView2 window could not be created, so the app hung before\n\
+             its own startup code ran. Typical causes: a stuck WebView2 runtime state,\n\
+             or a broken WebView2 user-data folder.\n\
+             \n\
+             Suggested fix:\n\
+             1. End any leftover tiez-app / tiez-app-fixed process in Task Manager.\n\
+             2. Rename or delete: %LOCALAPPDATA%\\com.tiez.app\\EBWebView\n\
+             3. Try again. If it still hangs, reboot (this clears stuck WebView2 state),\n\
+                then repair the WebView2 Runtime from Microsoft.\n",
+            SECS
+        );
+
+        if let Some(path) = report_dir_log(STARTUP_TIMEOUT_LOG) {
+            let _ = std::fs::write(path, &msg);
+        }
+        let _ = std::fs::write(std::env::temp_dir().join(STARTUP_TIMEOUT_LOG), &msg);
+
+        #[cfg(windows)]
+        crate::infrastructure::windows_ext::WindowExt::show_error_box(
+            "TieZ 启动超时",
+            &msg,
+        );
+    });
+}
 
 fn main() {
+    install_crash_reporter();
+    install_startup_watchdog();
+
     // 显式安装 rustls 的 crypto provider，防止 rumqttc 因缺少 provider 而 panic
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -44,8 +123,19 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin(tauri_plugin_http::init())
+        // NOTE: `tauri-plugin-http` used to be registered here. It is dead code in this
+        // app - nothing in `src/` references `@tauri-apps/plugin-http`, and the
+        // capability set in `tauri.conf.json` grants no `http:*` permission - yet its
+        // `setup` hook hard-fails the whole application when it cannot create its cookie
+        // store: `create_dir_all(app_cache_dir())` then opening
+        // `%LOCALAPPDATA%\<identifier>\.cookies` for append. Any environment where that
+        // write is denied (locked-down profile, hardened policy, restricted token) made
+        // TieZ exit silently before it even wrote a log line. Removing the registration
+        // costs nothing and removes that startup failure mode.
         .setup(|app| {
+            // Reached means the configured webview window was created successfully, so
+            // the watchdog can stand down.
+            APP_SETUP_REACHED.store(true, Ordering::SeqCst);
             setup::init(app)?;
             Ok(())
         })
