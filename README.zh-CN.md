@@ -72,6 +72,69 @@
 
 ---
 
+## 本地补丁
+
+本 Fork 在上游 `v0.3.3` 基础上修复了搜索卡顿与启动失败问题。
+致谢：[jimuzhe/tiez-clipboard](https://github.com/jimuzhe/tiez-clipboard) —— GPL-3.0 协议。
+
+### 搜索：FTS5 trigram 倒排索引
+
+上游用 `content LIKE '%' || ? || '%'` 做搜索。SQLite 无法为这种写法走索引，
+于是每次输入都要全表扫描 —— 而且**命中越少越慢**（无命中约 1.1 s，常见词约 2.1 s）。
+
+改为 FTS5 external-content 表 + `trigram` 分词器。这是 SQLite 官方唯一同时支持
+「保留子串语义」和「走索引」的方案：
+
+```sql
+CREATE VIRTUAL TABLE clipboard_fts USING fts5(
+    content, source_app,
+    content='clipboard_history', content_rowid='id',
+    tokenize='trigram'
+);
+```
+
+几个关键细节：
+
+- **两阶段查询。** 先用 FTS 取候选 `id`，再只回表取这几行的完整字段。
+  如果把宽字段直接放进 `ORDER BY`，SQLite 会走临时 B-tree，实测**比原来还慢**。
+- **候选集用 `LIKE` 复验。** 索引只是加速器，正确性仍由 `LIKE` 兜底。
+- **少于 3 个字符的词回退到 `LIKE`。** trigram 匹配不到，官方文档明确会退化成全表扫描。
+- **用户输入绝不直接拼进 MATCH 语法。** `AND`/`OR`/`*`/`(` 都是 FTS 操作符，
+  查询词统一包成转义后的引号短语。
+- **后台回填。** 473 MB 的库建索引实测约 62 s，因此迁移只执行 DDL，
+  由后台线程分批回填，每批之间释放连接，避免阻塞剪贴板采集。
+  回填完成前搜索自动走旧路径，功能不降级。
+
+### 启动：静默崩溃修复
+
+`tauri-plugin-http` 被注册但从未使用 —— 前端没有任何代码引用它，
+capability 也没有授予 `http:*`。但它的 `setup` 钩子只要无法创建 cookie 文件
+（`%LOCALAPPDATA%\<id>\.cookies`）就会让整个应用启动失败，
+而且是在**写出第一行日志之前**就退出。现已移除该注册。
+
+同时新增了崩溃报告器和 20 秒启动看门狗，让下次故障能给出明确信息，
+而不是留下一个看不见的进程。
+
+### 正确构建
+
+用 `cargo build --release` 编出来的 exe 是个**空壳**，不含任何前端资源 ——
+因为只有 Tauri CLI 会传 `DEP_TAURI_DEV`，否则会跳过资源嵌入，
+转而去连 `http://localhost:1420`。请始终用 Tauri CLI 构建：
+
+```bash
+npm install
+npx tauri build --no-bundle
+```
+
+部署前务必验证 —— 裸跑 `cargo build` 不会报任何错：
+
+```powershell
+$a = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes('tiez-app.exe'))
+$a.Contains('assets/index-')     # 必须为 True
+```
+
+---
+
 ## 系统要求
 
 ### 平台支持

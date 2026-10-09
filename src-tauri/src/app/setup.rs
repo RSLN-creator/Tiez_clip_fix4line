@@ -77,6 +77,11 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. App State Management
     setup_state(app, conn_arc.clone(), &settings, app_dir.clone());
+
+    // 5.1 One-time FTS5 trigram index backfill (background; search falls back to the
+    // linear path until it reports ready, so startup is not blocked).
+    crate::database::spawn_fts_backfill(conn_arc.clone());
+
     app.manage(EncryptionQueueState(init_encryption_queue(
         app_handle.clone(),
     )));

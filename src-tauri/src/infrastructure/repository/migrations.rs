@@ -198,7 +198,137 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])?;
     }
 
+    // Migration 10: FTS5 trigram full-text index over searchable text.
+    //
+    // Rationale: search used to be `content LIKE '%term%'`, which SQLite cannot
+    // accelerate with any B-tree index (leading wildcard), so every query was a
+    // full table scan over a multi-hundred-MB table. The trigram tokenizer is the
+    // only documented way to keep *substring* semantics while getting an index.
+    //
+    // The `content=` / `content_rowid=` form makes this an external-content index:
+    // FTS5 stores only the inverted index, the text stays in clipboard_history.
+    // Triggers below are the documented way to keep it in sync.
+    if current_version < 10 {
+        conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_fts USING fts5(
+                content,
+                source_app,
+                content='clipboard_history',
+                content_rowid='id',
+                tokenize='trigram'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS clipboard_history_ai AFTER INSERT ON clipboard_history BEGIN
+                INSERT INTO clipboard_fts(rowid, content, source_app)
+                VALUES (new.id, new.content, new.source_app);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS clipboard_history_ad AFTER DELETE ON clipboard_history BEGIN
+                INSERT INTO clipboard_fts(clipboard_fts, rowid, content, source_app)
+                VALUES ('delete', old.id, old.content, old.source_app);
+            END;
+
+            -- Only re-index when the searchable columns actually change. Without the
+            -- `OF` clause every `use_count`/`timestamp`/`tags` touch would re-tokenize
+            -- the whole payload (expensive for large rich-text rows).
+            CREATE TRIGGER IF NOT EXISTS clipboard_history_au
+            AFTER UPDATE OF content, source_app ON clipboard_history BEGIN
+                INSERT INTO clipboard_fts(clipboard_fts, rowid, content, source_app)
+                VALUES ('delete', old.id, old.content, old.source_app);
+                INSERT INTO clipboard_fts(rowid, content, source_app)
+                VALUES (new.id, new.content, new.source_app);
+            END;
+        ",
+        )?;
+
+        // The index is empty until the background backfill completes. Until then the
+        // repository transparently falls back to the legacy LIKE path, so search
+        // keeps working during the (one-time) rebuild.
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('fts.state', 'pending')",
+            [],
+        )?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
+    }
+
     Ok(())
+}
+
+/// Drives the one-time FTS index rebuild in bounded steps.
+///
+/// The caller is expected to lock the connection, run one [`FtsBackfill::step`],
+/// then release the lock before the next one. Rebuilding all 25k rows takes ~36 s on
+/// a 473 MB database, and the app funnels *every* database operation through a single
+/// `Mutex<Connection>` - doing it in one shot would stall clipboard capture for the
+/// whole duration.
+///
+/// Rows above `watermark` are deliberately excluded: they are inserted *after* the
+/// watermark is read and are therefore already covered by the `ai` trigger. That is
+/// what keeps this duplicate-free without a single long-held lock.
+pub struct FtsBackfill {
+    watermark: i64,
+    last_id: i64,
+    started: bool,
+}
+
+impl Default for FtsBackfill {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FtsBackfill {
+    pub fn new() -> Self {
+        Self {
+            watermark: -1,
+            last_id: 0,
+            started: false,
+        }
+    }
+
+    /// Indexes up to `batch` more rows. Returns how many rows this step indexed.
+    pub fn step(&mut self, conn: &Connection, batch: i64) -> Result<i64> {
+        if !self.started {
+            self.watermark = conn.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM clipboard_history",
+                [],
+                |row| row.get(0),
+            )?;
+            // Clear anything the triggers already wrote so the rebuild is exact.
+            conn.execute("INSERT INTO clipboard_fts(clipboard_fts) VALUES ('delete-all')", [])?;
+            self.started = true;
+        }
+
+        if self.last_id >= self.watermark {
+            return Ok(0);
+        }
+
+        let written = conn.execute(
+            "INSERT INTO clipboard_fts(rowid, content, source_app)
+             SELECT id, content, source_app
+               FROM clipboard_history
+              WHERE id > ?1 AND id <= ?2
+              ORDER BY id
+              LIMIT ?3",
+            params![self.last_id, self.watermark, batch],
+        )? as i64;
+
+        if written > 0 {
+            self.last_id = conn.query_row(
+                "SELECT MAX(id) FROM (SELECT id FROM clipboard_history
+                                       WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT ?3)",
+                params![self.last_id, self.watermark, batch],
+                |row| row.get(0),
+            )?;
+        }
+
+        Ok(written)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.started && self.last_id >= self.watermark
+    }
 }
 
 fn has_column(conn: &Connection, table_name: &str, column_name: &str) -> Result<bool> {

@@ -20,7 +20,9 @@ fn normalize_rich_text_item_content(item: &mut ClipboardEntry) {
     }
 }
 
-#[tauri::command]
+// Same reasoning as `search_clipboard_history`: this reads the database and must not
+// run on the UI thread.
+#[tauri::command(async)]
 pub fn get_clipboard_history(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
@@ -102,7 +104,10 @@ pub fn get_clipboard_history(
     Ok(history)
 }
 
-#[tauri::command]
+// `async` here is not about awaiting: Tauri runs a *synchronous* command on the main
+// thread, which freezes the whole window for the duration of the query. Marking it
+// `command(async)` moves the body onto the async runtime's worker pool.
+#[tauri::command(async)]
 pub fn search_clipboard_history(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,

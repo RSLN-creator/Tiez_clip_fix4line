@@ -7,7 +7,7 @@ use crate::infrastructure::encryption;
 use crate::infrastructure::repository::settings_repo::SqliteSettingsRepository;
 use rusqlite::params;
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +15,23 @@ use urlencoding::decode;
 
 const RICH_IMAGE_FALLBACK_PREFIX: &str = "<!--TIEZ_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX: &str = "-->";
+
+/// Canonical projection for clipboard rows. Column order must stay in sync with
+/// [`SqliteClipboardRepository::row_to_entry`].
+pub(crate) const ENTRY_COLUMNS: &str = "ch.id, ch.content_type, ch.content, ch.html_content, \
+     ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, \
+     ch.is_external, ch.pinned_order, ch.source_app_path";
+
+/// Tags whose entries are encrypted at rest and therefore cannot be matched by a
+/// plaintext index; they are searched separately after DPAPI decryption.
+pub(crate) fn sensitive_tags_sql() -> String {
+    let tags = crate::database::SENSITIVE_TAGS;
+    let parts: Vec<String> = tags
+        .iter()
+        .map(|t| format!("'{}'", t.replace('\'', "''")))
+        .collect();
+    format!("({})", parts.join(","))
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -67,11 +84,87 @@ pub trait ClipboardRepository {
 
 pub struct SqliteClipboardRepository {
     conn: Arc<Mutex<Connection>>,
+    /// Decrypted text of encrypted-at-rest (sensitive) entries, keyed by entry id.
+    ///
+    /// Entries are DPAPI-protected, so matching their plaintext requires one
+    /// `CryptUnprotectData` call per row (measured ~0.4 ms). With a few hundred
+    /// sensitive rows that cost dominated every search (~1.2 s) even after the query
+    /// itself became cheap. Caching the decrypted, lower-cased text removes it.
+    ///
+    /// Invalidation is implicit: the cache stores the row's `content_hash`, which the
+    /// repository recomputes from the *plaintext* whenever the row is re-encrypted, so
+    /// a changed row simply misses the cache. Nothing else has to be hooked.
+    sensitive_text_cache: Mutex<HashMap<i64, SensitiveCacheEntry>>,
+}
+
+/// See [`SqliteClipboardRepository::sensitive_text_cache`].
+struct SensitiveCacheEntry {
+    content_hash: i64,
+    content_lower: String,
+    source_app_lower: String,
+    tags_lower: Vec<String>,
 }
 
 impl SqliteClipboardRepository {
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            sensitive_text_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns lower-cased matchable text for a sensitive row, decrypting only on a
+    /// cache miss. The `content_hash` is taken from the encrypted row but was computed
+    /// from the plaintext by `encrypt_entry_with_conn`, so it is a reliable cache key.
+    fn sensitive_texts(
+        &self,
+        id: i64,
+        content_hash: i64,
+        content_raw: &str,
+        source_app: &str,
+        tags_json: &str,
+    ) -> (String, String, Vec<String>) {
+        let mut cache = self
+            .sensitive_text_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(hit) = cache.get(&id) {
+            if hit.content_hash == content_hash {
+                return (
+                    hit.content_lower.clone(),
+                    hit.source_app_lower.clone(),
+                    hit.tags_lower.clone(),
+                );
+            }
+        }
+
+        let plain = self.maybe_decrypt_text(content_raw);
+        let entry = SensitiveCacheEntry {
+            content_hash,
+            content_lower: plain.to_lowercase(),
+            source_app_lower: source_app.to_lowercase(),
+            tags_lower: serde_json::from_str::<Vec<String>>(tags_json)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.to_lowercase())
+                .collect(),
+        };
+
+        let result = (
+            entry.content_lower.clone(),
+            entry.source_app_lower.clone(),
+            entry.tags_lower.clone(),
+        );
+
+        // The cache is keyed by entry id; rows deleted from the database would linger
+        // here forever. It is small (one entry per sensitive row), but cap it anyway so
+        // it cannot grow without bound - clearing it only costs a re-decrypt.
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(id, entry);
+        result
     }
 
     pub fn encrypt_entry_with_conn(&self, conn: &Connection, id: i64) -> Result<(), String> {
@@ -230,6 +323,293 @@ impl SqliteClipboardRepository {
             encryption::decrypt_value(value).unwrap_or_else(|| value.to_string())
         } else {
             value.to_string()
+        }
+    }
+
+    /// Maps a row selected with [`ENTRY_COLUMNS`] into a [`ClipboardEntry`],
+    /// transparently decrypting any DPAPI-protected fields.
+    fn row_to_entry(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardEntry> {
+        let tags_str: String = row.get(8).unwrap_or_else(|_| "[]".to_string());
+        let content_raw: String = row.get(2)?;
+        let preview_raw: String = row.get(6)?;
+        let html_raw: Option<String> = row.get(3).ok();
+
+        Ok(ClipboardEntry {
+            id: row.get(0)?,
+            content_type: row.get(1)?,
+            content: self.maybe_decrypt_text(&content_raw),
+            html_content: html_raw.map(|v| self.maybe_decrypt_text(&v)),
+            source_app: row.get(4)?,
+            timestamp: row.get(5)?,
+            preview: self.maybe_decrypt_text(&preview_raw),
+            is_pinned: row.get::<_, i32>(7)? == 1,
+            tags: serde_json::from_str(&tags_str).unwrap_or_default(),
+            use_count: row.get(9).unwrap_or(0),
+            is_external: row.get::<_, i32>(10)? == 1,
+            pinned_order: row.get(11).unwrap_or(0),
+            source_app_path: row.get(12).unwrap_or(None),
+            file_preview_exists: true,
+        })
+    }
+
+    /// Indexed search path: FTS5 narrows to candidate rowids, the small candidate
+    /// set is re-verified with LIKE, and only the top `limit` rows are materialised.
+    ///
+    /// The two-phase shape matters. Selecting the wide columns before the LIMIT makes
+    /// SQLite spill `content` + `html_content` into a TEMP B-TREE sort, which measured
+    /// 5-7 s on the real 473 MB database - slower than the scan it replaced.
+    fn search_indexed(
+        &self,
+        conn: &Connection,
+        term: &str,
+        limit: i32,
+    ) -> Result<Vec<ClipboardEntry>, String> {
+        let phrase = crate::database::fts_phrase(term);
+        let sensitive = sensitive_tags_sql();
+
+        // Phase 1: rank candidate ids with the inverted index alone. Only (id, timestamp)
+        // enter the sorter.
+        //
+        // Verification is deliberately NOT done here. Running `LIKE` over every candidate
+        // meant reading the `content` column of each one - 1936 rows for a term like
+        // "http" - which cost more than the scan it replaced. Phase 2 already loads the
+        // plaintext, so the check is free there and only runs for the rows we return.
+        //
+        // The UNION covers matches that only exist in a tag; `clipboard_fts` indexes
+        // content + source_app, entry_tags is separate.
+        let sql_ids = format!(
+            "SELECT id FROM (
+                 SELECT ch.id AS id, ch.timestamp AS ts
+                   FROM clipboard_fts f
+                   JOIN clipboard_history ch ON ch.id = f.rowid
+                  WHERE clipboard_fts MATCH ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM entry_tags se
+                         WHERE se.entry_id = ch.id AND se.tag COLLATE NOCASE IN {sensitive}
+                    )
+                 UNION
+                 SELECT ch.id AS id, ch.timestamp AS ts
+                   FROM clipboard_history ch
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM entry_tags se
+                         WHERE se.entry_id = ch.id AND se.tag COLLATE NOCASE IN {sensitive}
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM entry_tags te
+                         WHERE te.entry_id = ch.id AND te.tag LIKE '%' || ?2 || '%'
+                    )
+             )
+             ORDER BY ts DESC, id DESC
+             LIMIT ?3",
+            sensitive = sensitive
+        );
+
+        let mut stmt = conn.prepare(&sql_ids).map_err(|e| e.to_string())?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![phrase, term, limit], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: materialise the full rows for the (bounded) candidate ids, and verify
+        // the match against the real plaintext. This keeps the index an accelerator: any
+        // stale entry (a row re-written while the one-time backfill was running) is
+        // dropped here rather than surfaced to the user.
+        //
+        // Fetched in chunks: SQLite caps the number of bound variables per statement, and
+        // `limit` is caller-supplied, so an IN (...) list of arbitrary length is not safe.
+        const CHUNK: usize = 400;
+        let mut results = Vec::new();
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let sql_rows = format!(
+                "SELECT {cols} FROM clipboard_history ch WHERE ch.id IN ({placeholders})",
+                cols = ENTRY_COLUMNS,
+                placeholders = placeholders
+            );
+
+            let mut stmt = conn.prepare(&sql_rows).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    self.row_to_entry(row)
+                })
+                .map_err(|e| e.to_string())?;
+
+            for row in rows {
+                let entry = row.map_err(|e| e.to_string())?;
+                let hit = entry.content.to_lowercase().contains(term)
+                    || entry.source_app.to_lowercase().contains(term)
+                    || entry
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(term));
+                if hit {
+                    results.push(entry);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Legacy linear path. Retained as the fallback for terms shorter than the
+    /// trigram minimum and while the index backfill is still running.
+    fn search_linear(
+        &self,
+        conn: &Connection,
+        term: &str,
+        limit: i32,
+    ) -> Result<Vec<ClipboardEntry>, String> {
+        let sensitive = sensitive_tags_sql();
+        let sql = format!(
+            "SELECT {cols}
+               FROM clipboard_history ch
+               LEFT JOIN entry_tags et ON ch.id = et.entry_id
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM entry_tags se
+                   WHERE se.entry_id = ch.id AND se.tag COLLATE NOCASE IN {sensitive}
+              )
+                AND (
+                  ch.content LIKE '%' || ?1 || '%'
+                  OR ch.source_app LIKE '%' || ?1 || '%'
+                  OR et.tag LIKE '%' || ?1 || '%'
+                )
+              ORDER BY ch.timestamp DESC, ch.id DESC
+              LIMIT ?2",
+            cols = ENTRY_COLUMNS,
+            sensitive = sensitive
+        );
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![term, limit], |row| self.row_to_entry(row))
+            .map_err(|e| e.to_string())?;
+
+        let mut results: Vec<ClipboardEntry> = Vec::new();
+        let mut seen: HashSet<i64> = HashSet::new();
+        for row in rows {
+            let entry = row.map_err(|e| e.to_string())?;
+            if seen.insert(entry.id) {
+                results.push(entry);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Searches entries that are encrypted at rest (DPAPI).
+    ///
+    /// Two deliberate properties:
+    ///
+    /// 1. The predicate is just the indexed `EXISTS (sensitive tag)`. The previous
+    ///    version OR'd in `content/preview/html_content LIKE 'dpapi:%'`, which forced
+    ///    SQLite to read `html_content` for all 25,300 rows (351 MB of the 473 MB
+    ///    database) and measured 1229 ms versus 9 ms - while selecting exactly the same
+    ///    rows (verified: symmetric difference of the two sets is empty).
+    ///
+    /// 2. Only matching-relevant columns are fetched, decryption goes through
+    ///    [`Self::sensitive_texts`] (cached), and the full entry - preview, HTML - is
+    ///    materialised *only* for rows that actually match. Decrypting every candidate
+    ///    row in full cost ~1.2 s per search on the reference database.
+    fn search_sensitive_paged(
+        &self,
+        conn: &Connection,
+        term: &str,
+        limit: i32,
+        results: &mut Vec<ClipboardEntry>,
+        seen: &mut HashSet<i64>,
+    ) -> Result<(), String> {
+        let sensitive = sensitive_tags_sql();
+        let sql = format!(
+            "SELECT ch.id, ch.content_hash, ch.content, ch.source_app, ch.tags, ch.timestamp
+               FROM clipboard_history ch
+              WHERE EXISTS (
+                  SELECT 1 FROM entry_tags se
+                   WHERE se.entry_id = ch.id AND se.tag COLLATE NOCASE IN {sensitive}
+              )
+                AND ((ch.timestamp < ?1) OR (ch.timestamp = ?1 AND ch.id < ?2))
+              ORDER BY ch.timestamp DESC, ch.id DESC
+              LIMIT ?3",
+            sensitive = sensitive
+        );
+
+        let mut cursor_ts = i64::MAX;
+        let mut cursor_id = i64::MAX;
+        const BATCH_SIZE: i32 = 500;
+
+        loop {
+            let mut matched: Vec<i64> = Vec::new();
+            let mut next_cursor: Option<(i64, i64)> = None;
+
+            {
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![cursor_ts, cursor_id, BATCH_SIZE], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1).unwrap_or(0),
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4).unwrap_or_else(|_| "[]".to_string()),
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+
+                let mut batch: Vec<(i64, i64, String, String, String, i64)> = Vec::new();
+                for row in rows {
+                    batch.push(row.map_err(|e| e.to_string())?);
+                }
+
+                if batch.is_empty() {
+                    return Ok(());
+                }
+                if let Some(last) = batch.last() {
+                    next_cursor = Some((last.5, last.0));
+                }
+
+                for (id, hash, content_raw, source_app, tags_json, _ts) in batch.iter() {
+                    if seen.contains(id) {
+                        continue;
+                    }
+                    let (content_lower, app_lower, tags_lower) = self.sensitive_texts(
+                        *id,
+                        *hash,
+                        content_raw,
+                        source_app,
+                        tags_json,
+                    );
+                    let hit = content_lower.contains(term)
+                        || app_lower.contains(term)
+                        || tags_lower.iter().any(|t| t.contains(term));
+                    if hit {
+                        matched.push(*id);
+                    }
+                }
+            }
+
+            for id in matched {
+                if !seen.insert(id) {
+                    continue;
+                }
+                if let Some(entry) = self.get_entry_by_id_with_conn(conn, id)? {
+                    results.push(entry);
+                    if results.len() >= limit as usize {
+                        return Ok(());
+                    }
+                }
+            }
+
+            match next_cursor {
+                Some((ts, id)) => {
+                    cursor_ts = ts;
+                    cursor_id = id;
+                }
+                None => return Ok(()),
+            }
         }
     }
 
@@ -955,214 +1335,43 @@ impl ClipboardRepository for SqliteClipboardRepository {
             return Ok(Vec::new());
         }
 
+        // The trigram index cannot answer terms shorter than 3 characters (documented
+        // FTS5 behaviour) and is empty until the one-time backfill completes; both
+        // cases fall back to the linear scan.
+        let indexed = crate::database::is_fts_ready(&conn)
+            && crate::database::fts_term_is_usable(&term);
+
         #[cfg(feature = "portable")]
         {
-            // Portable version: Data is NOT encrypted, use conventional SQL LIKE search (fastest)
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path 
-                 FROM clipboard_history ch
-                 LEFT JOIN entry_tags et ON ch.id = et.entry_id
-                 WHERE ch.content LIKE '%' || ? || '%' 
-                    OR ch.source_app LIKE '%' || ? || '%' 
-                    OR et.tag LIKE '%' || ? || '%'
-                 ORDER BY ch.timestamp DESC 
-                 LIMIT ?",
-            ).map_err(|e| e.to_string())?;
-
-            let rows = stmt
-                .query_map(params![term, term, term, limit], |row| {
-                    let tags_str: String =
-                        row.get::<_, String>(8).unwrap_or_else(|_| "[]".to_string());
-                    Ok(ClipboardEntry {
-                        id: row.get(0)?,
-                        content_type: row.get(1)?,
-                        content: row.get(2)?,
-                        html_content: row.get(3).ok(),
-                        source_app: row.get(4)?,
-                        timestamp: row.get(5)?,
-                        preview: row.get(6)?,
-                        is_pinned: row.get::<_, i32>(7)? == 1,
-                        tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-                        use_count: row.get(9).unwrap_or(0),
-                        is_external: row.get::<_, i32>(10)? == 1,
-                        pinned_order: row.get(11).unwrap_or(0),
-                        source_app_path: row.get(12).unwrap_or(None),
-                        file_preview_exists: true, // Simplified for search
-                    })
-                })
-                .map_err(|e| e.to_string())?;
-
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row.map_err(|e| e.to_string())?);
+            // Portable build: nothing is encrypted at rest, so the indexed path
+            // covers every entry and no DPAPI pass is required.
+            let mut results = if indexed {
+                self.search_indexed(&conn, &term, limit)?
+            } else {
+                self.search_linear(&conn, &term, limit)?
+            };
+            results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.id.cmp(&a.id)));
+            if results.len() > limit as usize {
+                results.truncate(limit as usize);
             }
-            Ok(results)
+            return Ok(results);
         }
 
         #[cfg(not(feature = "portable"))]
         {
-            let mut results: Vec<ClipboardEntry> = Vec::new();
-            let mut seen: HashSet<i64> = HashSet::new();
-
-            let sensitive_tags_sql = {
-                let tags = crate::database::SENSITIVE_TAGS;
-                let parts: Vec<String> = tags
-                    .iter()
-                    .map(|t| format!("'{}'", t.replace('\'', "''")))
-                    .collect();
-                format!("({})", parts.join(","))
+            let mut results = if indexed {
+                self.search_indexed(&conn, &term, limit)?
+            } else {
+                self.search_linear(&conn, &term, limit)?
             };
 
-            // 1) SQL search for non-sensitive (plaintext) entries
-            let sql_non_sensitive = format!(
-                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path 
-                 FROM clipboard_history ch
-                 LEFT JOIN entry_tags et ON ch.id = et.entry_id
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM entry_tags se 
-                     WHERE se.entry_id = ch.id 
-                       AND se.tag COLLATE NOCASE IN {}
-                 )
-                   AND (
-                     ch.content LIKE '%' || ?1 || '%' 
-                     OR ch.source_app LIKE '%' || ?1 || '%' 
-                     OR et.tag LIKE '%' || ?1 || '%'
-                   )
-                 ORDER BY ch.timestamp DESC, ch.id DESC
-                 LIMIT ?2",
-                sensitive_tags_sql
-            );
+            let mut seen: HashSet<i64> = results.iter().map(|e| e.id).collect();
 
-            let mut stmt = conn
-                .prepare(&sql_non_sensitive)
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(params![term, limit], |row| {
-                    let tags_str: String = row.get(8).unwrap_or_else(|_| "[]".to_string());
-                    let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
-                    let content_raw: String = row.get(2)?;
-                    let preview_raw: String = row.get(6)?;
-                    let html_raw: Option<String> = row.get(3).ok();
-                    let content = self.maybe_decrypt_text(&content_raw);
-                    let preview = self.maybe_decrypt_text(&preview_raw);
-                    let html_content = html_raw.map(|v| self.maybe_decrypt_text(&v));
-
-                    Ok(ClipboardEntry {
-                        id: row.get(0)?,
-                        content_type: row.get(1)?,
-                        content,
-                        html_content,
-                        source_app: row.get(4)?,
-                        timestamp: row.get(5)?,
-                        preview,
-                        is_pinned: row.get::<_, i32>(7)? == 1,
-                        tags,
-                        use_count: row.get(9).unwrap_or(0),
-                        is_external: row.get::<_, i32>(10)? == 1,
-                        pinned_order: row.get(11).unwrap_or(0),
-                        source_app_path: row.get(12).unwrap_or(None),
-                        file_preview_exists: true,
-                    })
-                })
-                .map_err(|e| e.to_string())?;
-
-            for row in rows {
-                if let Ok(entry) = row {
-                    if seen.insert(entry.id) {
-                        results.push(entry);
-                    }
-                }
-            }
-
-            // 2) Decrypt-scan sensitive or encrypted entries (only if needed)
+            // Encrypted/sensitive entries are not in the plaintext index, so they
+            // still need a decrypt pass - but only when the plaintext path did not
+            // already fill the page.
             if results.len() < limit as usize {
-                let mut cursor_ts = i64::MAX;
-                let mut cursor_id = i64::MAX;
-                let batch_size = 500;
-                let enc_like = format!("{}%", ENCRYPT_PREFIX);
-                let sql_sensitive = format!(
-                    "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path 
-                     FROM clipboard_history ch
-                     WHERE (
-                         EXISTS (
-                             SELECT 1 FROM entry_tags se 
-                             WHERE se.entry_id = ch.id 
-                               AND se.tag COLLATE NOCASE IN {}
-                         )
-                         OR ch.content LIKE ?1 
-                         OR ch.preview LIKE ?1 
-                         OR ch.html_content LIKE ?1
-                     )
-                       AND ((ch.timestamp < ?2) OR (ch.timestamp = ?2 AND ch.id < ?3))
-                     ORDER BY ch.timestamp DESC, ch.id DESC
-                     LIMIT ?4",
-                    sensitive_tags_sql
-                );
-
-                loop {
-                    let mut stmt = conn.prepare(&sql_sensitive).map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map(params![enc_like, cursor_ts, cursor_id, batch_size], |row| {
-                            let tags_str: String = row.get(8).unwrap_or_else(|_| "[]".to_string());
-                            Ok(ClipboardEntry {
-                                id: row.get(0)?,
-                                content_type: row.get(1)?,
-                                content: row.get(2)?, // Encrypted
-                                html_content: row.get(3).ok(),
-                                source_app: row.get(4)?,
-                                timestamp: row.get(5)?,
-                                preview: row.get(6)?, // Encrypted
-                                is_pinned: row.get::<_, i32>(7)? == 1,
-                                tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-                                use_count: row.get(9).unwrap_or(0),
-                                is_external: row.get::<_, i32>(10)? == 1,
-                                pinned_order: row.get(11).unwrap_or(0),
-                                source_app_path: row.get(12).unwrap_or(None),
-                                file_preview_exists: true,
-                            })
-                        })
-                        .map_err(|e| e.to_string())?;
-
-                    let mut batch: Vec<ClipboardEntry> = Vec::new();
-                    for row in rows {
-                        if let Ok(mut entry) = row {
-                            entry.content = self.maybe_decrypt_text(&entry.content);
-                            entry.preview = self.maybe_decrypt_text(&entry.preview);
-                            if let Some(html) = entry.html_content.take() {
-                                entry.html_content = Some(self.maybe_decrypt_text(&html));
-                            }
-                            batch.push(entry);
-                        }
-                    }
-
-                    if batch.is_empty() {
-                        break;
-                    }
-
-                    for entry in batch.iter() {
-                        let matches = entry.content.to_lowercase().contains(&term)
-                            || entry.source_app.to_lowercase().contains(&term)
-                            || entry.tags.iter().any(|t| t.to_lowercase().contains(&term));
-
-                        if matches && seen.insert(entry.id) {
-                            results.push(entry.clone());
-                            if results.len() >= limit as usize {
-                                break;
-                            }
-                        }
-                    }
-
-                    if results.len() >= limit as usize {
-                        break;
-                    }
-
-                    if let Some(last) = batch.last() {
-                        cursor_ts = last.timestamp;
-                        cursor_id = last.id;
-                    } else {
-                        break;
-                    }
-                }
+                self.search_sensitive_paged(&conn, &term, limit, &mut results, &mut seen)?;
             }
 
             results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.id.cmp(&a.id)));
@@ -1292,5 +1501,522 @@ impl ClipboardRepository for SqliteClipboardRepository {
     ) -> Result<Option<(String, String, Option<String>)>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         self.get_entry_content_with_html_with_conn(&conn, id)
+    }
+}
+
+/// Regression tests for the indexed search path.
+///
+/// The bug being locked down: search used `LIKE '%term%'`, which cannot use an index
+/// and degenerated into a full table scan whose cost grew with the database size. The
+/// fix routes search through an FTS5 trigram index, so these tests assert that the
+/// indexed path returns *exactly* what the linear `LIKE` path returned.
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::infrastructure::repository::migrations::{run_migrations, FtsBackfill};
+    use rusqlite::Connection;
+    use std::sync::{Arc, Mutex};
+
+    fn setup() -> Arc<Mutex<Connection>> {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&conn).expect("migrations");
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn insert(conn: &Connection, id: i64, content: &str, app: &str, ts: i64) {
+        conn.execute(
+            "INSERT INTO clipboard_history
+                 (id, content_type, content, source_app, timestamp, preview, is_pinned, tags,
+                  use_count, pinned_order, content_hash, html_content, is_external, source_app_path)
+             VALUES (?1, 'text', ?2, ?3, ?4, ?2, 0, '[]', 0, 0, 0, NULL, 0, NULL)",
+            params![id, content, app, ts],
+        )
+        .expect("insert row");
+    }
+
+    fn tag(conn: &Connection, id: i64, name: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO entry_tags (entry_id, tag) VALUES (?1, ?2)",
+            params![id, name],
+        )
+        .expect("insert tag");
+    }
+
+    /// Indexes everything and flips the ready flag, i.e. simulates a completed backfill.
+    fn finish_backfill(conn: &Connection) {
+        let mut bf = FtsBackfill::new();
+        loop {
+            let written = bf.step(conn, 2).expect("backfill step");
+            if written == 0 || bf.is_done() {
+                break;
+            }
+        }
+        crate::database::set_fts_state(conn, crate::database::FTS_STATE_READY).expect("set state");
+    }
+
+    /// Reference implementation: the original `LIKE '%term%'` semantics, restricted to
+    /// non-sensitive rows. Only used to assert the indexed path agrees with it.
+    fn reference_ids(conn: &Connection, term: &str, limit: i32) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT ch.id
+                   FROM clipboard_history ch
+                   LEFT JOIN entry_tags et ON ch.id = et.entry_id
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM entry_tags se
+                       WHERE se.entry_id = ch.id AND se.tag COLLATE NOCASE IN ('sensitive','密码')
+                  )
+                    AND (ch.content LIKE '%' || ?1 || '%'
+                         OR ch.source_app LIKE '%' || ?1 || '%'
+                         OR et.tag LIKE '%' || ?1 || '%')
+                  ORDER BY ch.timestamp DESC, ch.id DESC
+                  LIMIT ?2",
+            )
+            .expect("prepare reference");
+        let mut ids: Vec<i64> = stmt
+            .query_map(params![term, limit], |row| row.get(0))
+            .expect("query reference")
+            .filter_map(|r| r.ok())
+            .collect();
+        ids.dedup();
+        ids
+    }
+
+    fn search_ids(repo: &SqliteClipboardRepository, term: &str, limit: i32) -> Vec<i64> {
+        repo.search(term, limit)
+            .expect("search")
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// Faithful re-implementation of the ORIGINAL `search()` body (pre-fix), used as the
+    /// benchmark baseline. It runs the old `LIKE '%term%'` query, materialises full rows,
+    /// and then the old sensitive pass with its redundant `OR ... LIKE 'dpapi:%'`
+    /// predicate. Without this, comparing against an id-only query would flatter the fix.
+    fn legacy_search_ids(
+        conn: &Connection,
+        repo: &SqliteClipboardRepository,
+        term: &str,
+        limit: i32,
+    ) -> Vec<i64> {
+        let sensitive = sensitive_tags_sql();
+        let mut results: Vec<ClipboardEntry> = Vec::new();
+        let mut seen: HashSet<i64> = HashSet::new();
+
+        let sql = format!(
+            "SELECT DISTINCT {cols}
+               FROM clipboard_history ch
+               LEFT JOIN entry_tags et ON ch.id = et.entry_id
+              WHERE NOT EXISTS (SELECT 1 FROM entry_tags se
+                                 WHERE se.entry_id = ch.id
+                                   AND se.tag COLLATE NOCASE IN {sensitive})
+                AND (ch.content LIKE '%' || ?1 || '%'
+                     OR ch.source_app LIKE '%' || ?1 || '%'
+                     OR et.tag LIKE '%' || ?1 || '%')
+              ORDER BY ch.timestamp DESC, ch.id DESC
+              LIMIT ?2",
+            cols = ENTRY_COLUMNS,
+            sensitive = sensitive
+        );
+        {
+            let mut stmt = conn.prepare(&sql).expect("legacy prepare");
+            let rows = stmt
+                .query_map(params![term, limit], |row| repo.row_to_entry(row))
+                .expect("legacy query");
+            for row in rows.flatten() {
+                if seen.insert(row.id) {
+                    results.push(row);
+                }
+            }
+        }
+
+        if results.len() < limit as usize {
+            let sql2 = format!(
+                "SELECT {cols} FROM clipboard_history ch
+                  WHERE ( EXISTS (SELECT 1 FROM entry_tags se
+                                   WHERE se.entry_id = ch.id
+                                     AND se.tag COLLATE NOCASE IN {sensitive})
+                       OR ch.content LIKE 'dpapi:%'
+                       OR ch.preview LIKE 'dpapi:%'
+                       OR ch.html_content LIKE 'dpapi:%' )
+                    AND ((ch.timestamp < ?1) OR (ch.timestamp = ?1 AND ch.id < ?2))
+                  ORDER BY ch.timestamp DESC, ch.id DESC
+                  LIMIT ?3",
+                cols = ENTRY_COLUMNS,
+                sensitive = sensitive
+            );
+            let mut cursor_ts = i64::MAX;
+            let mut cursor_id = i64::MAX;
+            loop {
+                let mut batch: Vec<ClipboardEntry> = Vec::new();
+                {
+                    let mut stmt = conn.prepare(&sql2).expect("legacy2 prepare");
+                    let rows = stmt
+                        .query_map(params![cursor_ts, cursor_id, 500], |row| repo.row_to_entry(row))
+                        .expect("legacy2 query");
+                    for row in rows.flatten() {
+                        batch.push(row);
+                    }
+                }
+                if batch.is_empty() {
+                    break;
+                }
+                for entry in &batch {
+                    let hit = entry.content.to_lowercase().contains(term)
+                        || entry.source_app.to_lowercase().contains(term)
+                        || entry.tags.iter().any(|t| t.to_lowercase().contains(term));
+                    if hit && seen.insert(entry.id) {
+                        results.push(entry.clone());
+                        if results.len() >= limit as usize {
+                            break;
+                        }
+                    }
+                }
+                if results.len() >= limit as usize {
+                    break;
+                }
+                match batch.last() {
+                    Some(last) => {
+                        cursor_ts = last.timestamp;
+                        cursor_id = last.id;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.id.cmp(&a.id)));
+        results.truncate(limit as usize);
+        results.into_iter().map(|e| e.id).collect()
+    }
+
+    const CORPUS: &[(&str, &str, i64)] = &[
+        ("hello world sqlite database", "Code", 1000),
+        ("SQLite full text search with trigram", "Code", 2000),
+        ("这是一个中文测试内容，包含功能性描述", "Notepad", 3000),
+        ("世界和平是我们的共同愿望", "WeChat", 4000),
+        ("plain text entry about nothing", "Notepad", 5000),
+        ("prefix_sqlite_mid_sqlite_suffix", "Code", 6000),
+        ("mixed 中文 and english content", "Notepad", 7000),
+    ];
+
+    fn populate(conn: &Connection) {
+        for (i, (content, app, ts)) in CORPUS.iter().enumerate() {
+            insert(conn, (i + 1) as i64, content, app, *ts);
+        }
+        tag(conn, 6, "work");
+    }
+
+    #[test]
+    fn indexed_search_matches_like_for_terms_of_three_or_more_chars() {
+        for term in [
+            "sqlite",
+            "SQLITE",
+            "trigram",
+            "functional",
+            "功能性",
+            "世界和平",
+            "prefix_sqlite_mid",
+            "中文",
+        ] {
+            // Each term gets a fresh database so the comparison is independent.
+            let shared = setup();
+            let expected = {
+                let conn = shared.lock().unwrap();
+                populate(&conn);
+                finish_backfill(&conn);
+                assert!(
+                    crate::database::is_fts_ready(&conn),
+                    "backfill should report ready"
+                );
+                reference_ids(&conn, &term.to_lowercase(), 50)
+            };
+            // NOTE: the guard above is dropped before search(), which takes the same
+            // mutex - holding it would deadlock.
+            let repo = SqliteClipboardRepository::new(shared.clone());
+            let actual = search_ids(&repo, term, 50);
+
+            assert_eq!(
+                actual, expected,
+                "indexed search for {:?} disagreed with LIKE semantics",
+                term
+            );
+        }
+    }
+
+    #[test]
+    fn short_terms_fall_back_and_still_match() {
+        let shared = setup();
+        {
+            let conn = shared.lock().unwrap();
+            populate(&conn);
+            finish_backfill(&conn);
+        }
+        let repo = SqliteClipboardRepository::new(shared.clone());
+
+        // The trigram tokenizer cannot answer <3 characters; the fallback must.
+        let ids = search_ids(&repo, "世界", 50);
+        assert_eq!(ids, vec![4], "2-char CJK term should match row 4");
+
+        let ids = search_ids(&repo, "sq", 50);
+        assert_eq!(ids, vec![6, 2, 1], "2-char ASCII term should match by LIKE");
+    }
+
+    #[test]
+    fn terms_before_backfill_completes_use_the_fallback() {
+        let shared = setup();
+        {
+            let conn = shared.lock().unwrap();
+            populate(&conn);
+            // Deliberately do NOT finish the backfill.
+            assert!(!crate::database::is_fts_ready(&conn));
+        }
+        let repo = SqliteClipboardRepository::new(shared.clone());
+        let ids = search_ids(&repo, "sqlite", 50);
+        assert_eq!(
+            ids,
+            vec![6, 2, 1],
+            "un-indexed database must still return LIKE results"
+        );
+    }
+
+    #[test]
+    fn fts_operator_syntax_in_user_input_is_not_interpreted() {
+        let shared = setup();
+        {
+            let conn = shared.lock().unwrap();
+            populate(&conn);
+            finish_backfill(&conn);
+        }
+        let repo = SqliteClipboardRepository::new(shared.clone());
+
+        // If the term were interpolated raw into MATCH these would raise an FTS5 syntax
+        // error or silently change the query's meaning.
+        for term in ["AND", "OR NOT", "\"quoted\"", "a*", "(paren)", "col:x", "NEAR/2"] {
+            let res = repo.search(term, 50);
+            assert!(res.is_ok(), "term {:?} must not error: {:?}", term, res.err());
+        }
+
+        // A term containing a double quote must be treated literally, not as syntax.
+        let ids = search_ids(&repo, "\"sqlite\"", 50);
+        assert!(
+            ids.is_empty(),
+            "no row literally contains quotes; got {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn sensitive_encrypted_entries_are_still_searchable() {
+        let shared = setup();
+        {
+            let conn = shared.lock().unwrap();
+            insert(&conn, 1, "public note about sqlite", "Code", 1000);
+            insert(&conn, 2, "top secret api key sqlite", "Code", 2000);
+            tag(&conn, 2, "sensitive");
+            finish_backfill(&conn);
+
+            // Encrypt row 2 the way the app does on capture.
+            let repo = SqliteClipboardRepository::new(shared.clone());
+            repo.encrypt_entry_with_conn(&conn, 2).expect("encrypt");
+
+            let raw: String = conn
+                .query_row("SELECT content FROM clipboard_history WHERE id = 2", [], |r| r.get(0))
+                .unwrap();
+            assert!(
+                raw.starts_with(ENCRYPT_PREFIX),
+                "row 2 should be encrypted at rest"
+            );
+        }
+
+        let repo = SqliteClipboardRepository::new(shared.clone());
+        let ids = search_ids(&repo, "secret", 50);
+        assert_eq!(
+            ids,
+            vec![2],
+            "plaintext search must still reach the encrypted entry"
+        );
+
+        // And a term only present in the public row must not pull in the secret one.
+        let ids = search_ids(&repo, "public", 50);
+        assert_eq!(ids, vec![1]);
+    }
+
+    /// End-to-end verification of the real upgrade path: takes a *copy* of a production
+    /// `clipboard.db` (still on migration 9, no FTS objects), applies migration 10,
+    /// runs the real background backfill, and then measures and validates the real
+    /// search path against the original `LIKE` semantics.
+    ///
+    /// Opt-in because it needs a real database:
+    /// `set TIEZ_REAL_DB=<copy of clipboard.db>`
+    /// `cargo test --bin tiez-app -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs TIEZ_REAL_DB pointing at a copy of a real clipboard.db"]
+    fn real_database_upgrade_path_is_correct_and_fast() {
+        use std::time::Instant;
+
+        let path = match std::env::var("TIEZ_REAL_DB") {
+            Ok(p) if !p.trim().is_empty() => p,
+            _ => {
+                eprintln!("TIEZ_REAL_DB not set; skipping real-database verification");
+                return;
+            }
+        };
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "TIEZ_REAL_DB does not exist: {}",
+            path
+        );
+
+        let shared = Arc::new(Mutex::new(Connection::open(&path).expect("open real db")));
+        let (before_version, rows, before_fts) = {
+            let conn = shared.lock().unwrap();
+            conn.execute_batch("PRAGMA mmap_size=268435456; PRAGMA cache_size=-16384;")
+                .expect("pragmas");
+            let v: i32 = conn
+                .query_row("SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0))
+                .unwrap_or(0);
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM clipboard_history", [], |r| r.get(0))
+                .expect("count");
+            let fts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%fts%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("fts count");
+            (v, n, fts)
+        };
+        eprintln!(
+            "[REALDB] before: migration={} rows={} fts_objects={}",
+            before_version, rows, before_fts
+        );
+        assert_eq!(before_fts, 0, "expected a pre-FTS database");
+
+        // Apply migration 10 the way the app does at startup.
+        let migrate_ms = {
+            let conn = shared.lock().unwrap();
+            let t = Instant::now();
+            run_migrations(&conn).expect("run_migrations");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        {
+            let conn = shared.lock().unwrap();
+            let after: i32 = conn
+                .query_row("SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0))
+                .unwrap();
+            let fts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%fts%' AND type='table'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            eprintln!("[REALDB] migration applied in {:.0} ms; version now {}; fts tables {}", migrate_ms, after, fts);
+            assert!(after >= 10, "migration 10 must be recorded");
+            assert!(fts >= 1, "clipboard_fts must exist");
+        }
+
+        // Run the real batched backfill exactly as spawn_fts_backfill does.
+        let backfill = {
+            let mut bf = FtsBackfill::new();
+            let t = Instant::now();
+            let mut total = 0i64;
+            loop {
+                let n = {
+                    let conn = shared.lock().unwrap();
+                    bf.step(&conn, 500).expect("backfill step")
+                };
+                total += n;
+                if n == 0 || bf.is_done() {
+                    break;
+                }
+            }
+            (t.elapsed().as_secs_f64(), total)
+        };
+        {
+            let conn = shared.lock().unwrap();
+            crate::database::set_fts_state(&conn, crate::database::FTS_STATE_READY).expect("ready");
+        }
+        eprintln!(
+            "[REALDB] backfill: {} rows in {:.1} s",
+            backfill.1, backfill.0
+        );
+        assert_eq!(backfill.1, rows, "every row must be indexed");
+
+        // The backfill leaves a very large WAL; checkpoint it and warm the page cache so
+        // the numbers reflect steady state rather than first-touch I/O.
+        {
+            let conn = shared.lock().unwrap();
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+
+        // Compare the indexed path against the original LIKE semantics, and time both.
+        // Median of N runs after a warm-up; single cold runs on a 650 MB database are
+        // dominated by I/O noise.
+        const REPS: usize = 5;
+        let terms = ["TieZ", "sqlite", "http", "clip", "的一个", "zzqqxx_not_found"];
+        for term in terms {
+            let repo = SqliteClipboardRepository::new(shared.clone());
+
+            // warm-up pass for both paths
+            let like_ids = {
+                let conn = shared.lock().unwrap();
+                legacy_search_ids(&conn, &repo, term, 200)
+            };
+            let _ = repo.search(term, 200).expect("warm-up search");
+
+            let mut like_ms = Vec::new();
+            for _ in 0..REPS {
+                let conn = shared.lock().unwrap();
+                let t = Instant::now();
+                let _ = legacy_search_ids(&conn, &repo, term, 200);
+                like_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            let mut idx_ms = Vec::new();
+            let mut got: Vec<i64> = Vec::new();
+            for _ in 0..REPS {
+                let t = Instant::now();
+                got = repo
+                    .search(term, 200)
+                    .expect("indexed search")
+                    .into_iter()
+                    .map(|e| e.id)
+                    .collect();
+                idx_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let like_med = med(&mut like_ms);
+            let idx_med = med(&mut idx_ms);
+
+            eprintln!(
+                "[REALDB] term={:<20} ORIGINAL {:8.1} ms ({} ids) | FIXED {:8.1} ms ({} ids) | speedup {:.1}x",
+                format!("{:?}", term),
+                like_med,
+                like_ids.len(),
+                idx_med,
+                got.len(),
+                like_med / idx_med.max(0.001)
+            );
+
+            // Same id set (order may differ for equal timestamps), same size.
+            let mut a = like_ids.clone();
+            let mut b = got.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(
+                b, a,
+                "indexed search disagreed with LIKE for term {:?}",
+                term
+            );
+        }
+        eprintln!("[REALDB] all terms agreed with LIKE semantics");
     }
 }

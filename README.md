@@ -72,6 +72,74 @@ Explore 4 elegant themes designed for every workspace and efficiency scenarios.
 
 ---
 
+## Local Patches
+
+This fork adds search and startup fixes on top of upstream `v0.3.3`.
+Attribution: [jimuzhe/tiez-clipboard](https://github.com/jimuzhe/tiez-clipboard) — GPL-3.0.
+
+### Search: FTS5 trigram index
+
+Upstream searched with `content LIKE '%' || ? || '%'`. SQLite cannot use an index for
+that shape, so every keystroke scanned the whole table — and the rarer the term, the
+slower it got (a no-match term took ~1.1 s, a common one ~2.1 s).
+
+Replaced with an FTS5 external-content table using the `trigram` tokenizer, which is
+the only officially supported way to keep substring semantics *and* use an index:
+
+```sql
+CREATE VIRTUAL TABLE clipboard_fts USING fts5(
+    content, source_app,
+    content='clipboard_history', content_rowid='id',
+    tokenize='trigram'
+);
+```
+
+Details that matter:
+
+- **Two-phase query.** Fetch candidate `id`s with FTS, then load full rows for just
+  those. Putting wide columns in `ORDER BY` makes SQLite spill to a temp B-tree and
+  is measurably *slower* than the original.
+- **Candidate sets are re-checked with `LIKE`.** The index is an accelerator; `LIKE`
+  remains the source of truth for correctness.
+- **Terms shorter than 3 characters fall back to `LIKE`.** trigram cannot match them,
+  and SQLite's docs warn it degrades to a full scan.
+- **User input never enters MATCH syntax raw.** `AND`/`OR`/`*`/`(` are FTS operators;
+  terms are wrapped as escaped quoted phrases.
+- **Background backfill.** Building the index on a 473 MB database took ~62 s, so
+  migration only does DDL and a background thread backfills in batches, releasing the
+  connection between batches so clipboard capture is never blocked. Until it finishes,
+  searches transparently use the old path.
+
+### Startup: silent-crash fix
+
+`tauri-plugin-http` was registered but never used — no frontend code imports it and no
+capability grants `http:*`. Its `setup` hook nonetheless hard-fails the whole app when
+it cannot create its cookie store (`%LOCALAPPDATA%\<id>\.cookies`). On such machines
+TieZ exited **before writing a single log line**. The registration is removed.
+
+A crash reporter and a 20-second startup watchdog were added so the next failure says
+something specific instead of leaving an invisible process.
+
+### Build correctly
+
+`cargo build --release` produces a **hollow exe** with no UI — it silently skips asset
+embedding because only the Tauri CLI passes `DEP_TAURI_DEV`, and then tries to load
+`http://localhost:1420`. Always build with the Tauri CLI:
+
+```bash
+npm install
+npx tauri build --no-bundle
+```
+
+Verify before deploying — a bare `cargo build` will not report this:
+
+```powershell
+$a = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes('tiez-app.exe'))
+$a.Contains('assets/index-')     # must be True
+```
+
+---
+
 ## Installation
 
 ### Platform Support
