@@ -156,6 +156,13 @@ impl SqliteClipboardRepository {
             entry.source_app_lower.clone(),
             entry.tags_lower.clone(),
         );
+
+        // The cache is keyed by entry id; rows deleted from the database would linger
+        // here forever. It is small (one entry per sensitive row), but cap it anyway so
+        // it cannot grow without bound - clearing it only costs a re-decrypt.
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
         cache.insert(id, entry);
         result
     }
@@ -413,29 +420,37 @@ impl SqliteClipboardRepository {
         // the match against the real plaintext. This keeps the index an accelerator: any
         // stale entry (a row re-written while the one-time backfill was running) is
         // dropped here rather than surfaced to the user.
-        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
-        let sql_rows = format!(
-            "SELECT {cols} FROM clipboard_history ch WHERE ch.id IN ({placeholders})",
-            cols = ENTRY_COLUMNS,
-            placeholders = placeholders
-        );
-
-        let mut stmt = conn.prepare(&sql_rows).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(ids.iter()), |row| self.row_to_entry(row))
-            .map_err(|e| e.to_string())?;
-
+        //
+        // Fetched in chunks: SQLite caps the number of bound variables per statement, and
+        // `limit` is caller-supplied, so an IN (...) list of arbitrary length is not safe.
+        const CHUNK: usize = 400;
         let mut results = Vec::new();
-        for row in rows {
-            let entry = row.map_err(|e| e.to_string())?;
-            let hit = entry.content.to_lowercase().contains(term)
-                || entry.source_app.to_lowercase().contains(term)
-                || entry
-                    .tags
-                    .iter()
-                    .any(|t| t.to_lowercase().contains(term));
-            if hit {
-                results.push(entry);
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let sql_rows = format!(
+                "SELECT {cols} FROM clipboard_history ch WHERE ch.id IN ({placeholders})",
+                cols = ENTRY_COLUMNS,
+                placeholders = placeholders
+            );
+
+            let mut stmt = conn.prepare(&sql_rows).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    self.row_to_entry(row)
+                })
+                .map_err(|e| e.to_string())?;
+
+            for row in rows {
+                let entry = row.map_err(|e| e.to_string())?;
+                let hit = entry.content.to_lowercase().contains(term)
+                    || entry.source_app.to_lowercase().contains(term)
+                    || entry
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(term));
+                if hit {
+                    results.push(entry);
+                }
             }
         }
         Ok(results)
