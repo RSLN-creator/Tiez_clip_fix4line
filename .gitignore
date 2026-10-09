@@ -43,3 +43,6 @@ git_log_out.txt
 
 # Sub-projects
 mobile-app/
+
+# Local DSH scratch dirs (build target + TEMP redirect)
+_tmp/
